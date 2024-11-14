@@ -2440,7 +2440,8 @@ class TransformerWrapper(Module):
         to_logits_kwargs = dict(),
         **kwargs,
     ):
-        b, n, device, num_mems, has_memory_tokens, emb_frac_gradient, orig_mask = x.shape[0], x.shape[1], x.device, self.num_memory_tokens, self.num_memory_tokens > 0, self.emb_frac_gradient, mask
+        b, n, device, num_mems, has_memory_tokens, emb_frac_gradient, orig_mask = (x.shape[0], x.shape[1],
+        x.device, self.num_memory_tokens, self.num_memory_tokens > 0, self.emb_frac_gradient, mask)
 
         return_hiddens = return_mems | return_attn | return_intermediates | return_attn_z_loss
         return_embeddings = return_embeddings | (not exists(self.to_logits))
