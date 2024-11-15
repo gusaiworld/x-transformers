@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import Callable
-
+from x_transformers.x_transformers import (DynamicPositionBias,AlibiPositionalBias,LayerNorm,AdaptiveLayerNorm,ScaleNorm,RMSNorm,AdaptiveRMSNorm,SimpleRMSNorm,LayerScale,Attention,equals,not_equals,Scale,
+                                           FeedForward,TransformerWrapper,pad_at_dim,AttentionLayers,ConcatCombine,calc_z_loss,Residual,GRUGating,softclamp,ShiftTokens,GLU,AdaptiveLayerScale)
 import math
 from random import random, randrange
 from packaging import version
@@ -27,8 +28,8 @@ import tqdm
 import torch
 import torch.optim as optim
 from functools import partial, wraps
+from x_transformers.x_transformers import XTransformer
 
-LinearNoBias = partial(nn.Linear, bias = False)
 
 def max_neg_value(tensor):
     return -torch.finfo(tensor.dtype).max
@@ -111,6 +112,29 @@ def groupby_prefix_and_trim(prefix, d):
     prefix_len = len(prefix)
     kwargs_without_prefix = {key[prefix_len:]: value for key, value in kwargs_with_prefix.items()}
     return kwargs_without_prefix, kwargs
+
+def rotate_half(x):
+    x = rearrange(x, '... (d r) -> ... d r', r = 2)
+    x1, x2 = x.unbind(dim = -1)
+    x = torch.stack((-x2, x1), dim = -1)
+    return rearrange(x, '... d r -> ... (d r)')
+
+@autocast('cuda', enabled = False)
+def apply_rotary_pos_emb(t, freqs, scale = 1):
+    rot_dim, seq_len, orig_dtype = freqs.shape[-1], t.shape[-2], t.dtype
+
+    freqs = freqs[-seq_len:, :]
+    scale = scale[-seq_len:, :] if isinstance(scale, torch.Tensor) else scale
+
+    if t.ndim == 4 and freqs.ndim == 3:
+        freqs = rearrange(freqs, 'b n d -> b 1 n d')
+
+    # partial rotary embeddings, Wang et al. GPT-J
+    t, t_unrotated = t[..., :rot_dim], t[..., rot_dim:]
+    t = (t * freqs.cos() * scale) + (rotate_half(t) * freqs.sin() * scale)
+    out = torch.cat((t, t_unrotated), dim = -1)
+
+    return out.type(orig_dtype)
 
 
 def masked_mean(t, mask = None, dim = 1):
@@ -249,6 +273,106 @@ class LayerNorm(Module):
         gamma = self.gamma + float(self.unit_offset)
         return normed * gamma
 
+class RotaryEmbedding(Module):
+    def __init__(
+        self,
+        dim,
+        use_xpos = False,
+        scale_base = 512,
+        interpolation_factor = 1.,
+        base = 10000,
+        base_rescale_factor = 1.
+    ):
+        super().__init__()
+        # proposed by reddit user bloc97, to rescale rotary embeddings to longer sequence length without fine-tuning
+        # has some connection to NTK literature
+        # https://www.reddit.com/r/LocalLLaMA/comments/14lz7j5/ntkaware_scaled_rope_allows_llama_models_to_have/
+        base *= base_rescale_factor ** (dim / (dim - 2))
+
+        inv_freq = 1. / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+
+        assert interpolation_factor >= 1.
+        self.interpolation_factor = interpolation_factor
+
+        if not use_xpos:
+            self.register_buffer('scale', None)
+            return
+
+        scale = (torch.arange(0, dim, 2) + 0.4 * dim) / (1.4 * dim)
+
+        self.scale_base = scale_base
+        self.register_buffer('scale', scale)
+
+    def forward_from_seq_len(self, seq_len):
+        device = self.inv_freq.device
+
+        t = torch.arange(seq_len, device = device)
+        return self.forward(t)
+
+    @autocast('cuda', enabled = False)
+    def forward(self, t):
+        max_pos = t.max() + 1
+
+        freqs = torch.einsum('i , j -> i j', t.type_as(self.inv_freq), self.inv_freq) / self.interpolation_factor
+        freqs = torch.stack((freqs, freqs), dim = -1)
+        freqs = rearrange(freqs, '... d r -> ... (d r)')
+
+        if not exists(self.scale):
+            return freqs, 1.
+
+        power = (t - (max_pos // 2)) / self.scale_base
+        scale = self.scale ** rearrange(power, 'n -> n 1')
+        scale = torch.stack((scale, scale), dim = -1)
+        scale = rearrange(scale, '... d r -> ... (d r)')
+
+        return freqs, scale
+
+class RelativePositionBias(Module):
+    def __init__(self, scale, causal = False, num_buckets = 32, max_distance = 128, heads = 8):
+        super().__init__()
+        self.scale = scale
+        self.causal = causal
+        self.num_buckets = num_buckets
+        self.max_distance = max_distance
+        self.relative_attention_bias = nn.Embedding(num_buckets, heads)
+
+    @staticmethod
+    def _relative_position_bucket(relative_position, causal = True, num_buckets = 32, max_distance = 128):
+        ret = 0
+        n = -relative_position
+        if not causal:
+            num_buckets //= 2
+            ret += (n < 0).long() * num_buckets
+            n = torch.abs(n)
+        else:
+            n = torch.max(n, torch.zeros_like(n))
+
+        max_exact = num_buckets // 2
+        is_small = n < max_exact
+
+        val_if_large = max_exact + (
+            torch.log(n.float() / max_exact) / math.log(max_distance / max_exact) * (num_buckets - max_exact)
+        ).long()
+        val_if_large = torch.min(val_if_large, torch.full_like(val_if_large, num_buckets - 1))
+
+        ret += torch.where(is_small, n, val_if_large)
+        return ret
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def forward(self, i, j):
+        device = self.device
+        q_pos = torch.arange(j - i, j, dtype = torch.long, device = device)
+        k_pos = torch.arange(j, dtype = torch.long, device = device)
+        rel_pos = einx.subtract('j, i -> i j', k_pos, q_pos)
+        rp_bucket = self._relative_position_bucket(rel_pos, causal = self.causal, num_buckets = self.num_buckets, max_distance = self.max_distance)
+        values = self.relative_attention_bias(rp_bucket)
+        bias = rearrange(values, 'i j h -> h i j')
+        return bias * self.scale
+'''
 class AttentionLayers(Module):
     def __init__(
         self,
@@ -888,7 +1012,7 @@ class AttentionLayers(Module):
         )
 
         return x, intermediates
-
+'''
 
 class Encoder(AttentionLayers):
     def __init__(self, **kwargs):
@@ -900,29 +1024,46 @@ class Decoder(AttentionLayers):
         assert 'causal' not in kwargs, 'cannot set causality on decoder'
         super().__init__(causal = True, **kwargs)
 
-class transformerwrap:
-    def __init__(self, *, num_tokens,max_seq_len,depth,head,attn_layers,emb_dim,
-                 l2norm_embed,
-                 embed_ids: dict[str, Tensor] = dict(),
-                return_only_embed = False ,
-                 tie_embedding= False,
-                logits_dim = None,
-                 use_abs_pos_emb = True,
-                 token_emb: TokenEmbedding | None = None,
-                mixture_of_softmax = False,
-                 emb_dropout = 0.,
-                mixture_of_softmax_k = 4,
-                 num_output_heads=1,
-                 post_emb_norm = False,
-                sigsoftmax_logits = False,
-                to_logits: Module | None = None,
-                scaled_sinu_pos_emb = False,):
+class transformerwrap(Module):
+    def __init__(self,
+        *,
+        num_tokens,
+        max_seq_len,
+        attn_layers: AttentionLayers,
+        embed_num_tokens: dict[str, int] = dict(),
+        emb_dim = None,
+        max_mem_len = 0,
+        shift_mem_down = 0,
+        emb_dropout = 0.,
+        post_emb_norm = False,
+        num_memory_tokens = None,
+        memory_tokens_interspersed_every = None,
+        tie_embedding = False,
+        logits_dim = None,
+        return_only_embed = False,
+        num_output_heads = 1,
+        use_abs_pos_emb = True,
+        scaled_sinu_pos_emb = False,
+        l2norm_embed = False,
+        recycling = False,            # from Jumper et al. - Alphafold2
+        train_max_recycle_steps = 4,  # saw a benefit for language modeling up to 3 recycling steps, so let's default this to 4
+        emb_frac_gradient = 1.,       # GLM-130B and Cogview successfully used this, set at 0.1
+        attn_z_loss_weight = 1e-4,
+        average_pool_embed = False,
+        use_cls_token = False,
+        num_cls_tokens = 1,
+        squeeze_out_last_dim = False,
+        token_emb: TokenEmbedding | None = None,
+        mixture_of_softmax = False,
+        mixture_of_softmax_k = 4,
+        sigsoftmax_logits = False,
+        to_logits: Module | None = None,):
+        super().__init__()
         dim = attn_layers.dim
         emb_dim = default(emb_dim, dim)
         self.num_tokens=num_tokens,
-        self.depth=depth,
-        self.head=head,
-        self.attn_layers=attn_layers,
+        self.max_seq_len=max_seq_len,
+        #self.attn_layers=attn_layers,
         self.emb_dim=emb_dim,
         self.l2norm_embed = l2norm_embed
         self.return_only_embed = return_only_embed,
@@ -930,15 +1071,35 @@ class transformerwrap:
         self.emb_dropout = nn.Dropout(emb_dropout)
         self.post_emb_norm = LayerNorm(emb_dim) if post_emb_norm else nn.Identity()
 
+        self.embeds = None
         if not exists(token_emb):
             token_emb = TokenEmbedding(emb_dim, num_tokens, l2norm_embed=l2norm_embed)
 
+        self.token_emb = token_emb
+
         if use_abs_pos_emb:
-            pos_emb=AbsolutePositionalEmbedding(emb_dim, max_seq_len, l2norm_embed = l2norm_embed)
+            self.pos_emb=AbsolutePositionalEmbedding(emb_dim, max_seq_len, l2norm_embed = l2norm_embed)
         elif scaled_sinu_pos_emb:
             self.pos_emb = ScaledSinusoidalEmbedding(emb_dim)
         else:
             self.pos_emb = always(0)
+
+        if len(embed_num_tokens) > 0:
+            self.embeds = ModuleDict(
+                {f'{name}_embed': nn.Embedding(num_tokens, emb_dim) for name, num_tokens in embed_num_tokens.items()})
+
+        self.post_emb_norm = LayerNorm(emb_dim) if post_emb_norm else nn.Identity()
+        self.emb_dropout = nn.Dropout(emb_dropout)
+
+        self.project_emb = nn.Linear(emb_dim, dim) if emb_dim != dim else nn.Identity()
+        self.attn_layers = attn_layers
+
+        self.init_()
+
+        self.recycling = recycling
+        self.train_max_recycle_steps = train_max_recycle_steps
+
+        self.average_pool_embed = average_pool_embed
 
         self.to_mixture = None
         self.combine_mixture = None
@@ -952,6 +1113,9 @@ class transformerwrap:
             )
 
             self.combine_mixture = LinearNoBias(dim, mixture_of_softmax_k)
+
+        logits_dim = default(logits_dim, num_tokens)
+        self.has_multiple_heads = num_output_heads > 1
 
         if return_only_embed:
             self.to_logits = None
@@ -971,26 +1135,37 @@ class transformerwrap:
             if not isinstance(self.pos_emb, always):
                 nn.init.normal_(self.pos_emb.emb.weight, std=1e-5)
 
-    def forward(self, x,
-                return_embeddings = False,
-                return_logits_and_embeddings = False,
-                mask = None,pos = None,
-                recycle_steps=None,
-                return_mems=False,
-                return_attn=False,
-                mems=None,
-                mem_masks=None,
-                cache: LayerIntermediates | None = None,
-                token_emb_kwargs = dict(),
-                to_logits_kwargs = dict(),
-                embed_ids: dict[str, Tensor] = dict(),
-                seq_start_pos=None,
-                **kwargs,):
+    def forward(  self,
+        x,
+        return_embeddings = False,
+        return_logits_and_embeddings = False,
+        return_intermediates = False,
+        mask = None,
+        return_mems = False,
+        return_attn = False,
+        mems = None,
+        mem_masks = None,
+        recycle_steps = None,
+        pos = None,
+        prepend_embeds = None,
+        prepend_mask = None,
+        embed_ids: dict[str, Tensor] = dict(),
+        sum_embeds = None,
+        return_attn_z_loss = False,
+        attn_z_loss_weight = 1e-4,
+        seq_start_pos = None,
+        cache: LayerIntermediates | None = None,
+        token_emb_kwargs = dict(),
+        to_logits_kwargs = dict(),
+        **kwargs,):
         orig_mask=mask
 
         external_pos_emb = exists(pos) and pos.dtype != torch.long
         pos_emb = self.pos_emb(x, pos=pos, seq_start_pos=seq_start_pos) if not external_pos_emb else pos
         x = self.token_emb(x, **token_emb_kwargs) + pos_emb
+
+        assert not (exists(self.embeds) ^ (
+                    len(embed_ids) > 0)), '`embed_num_tokens` must be defined on `TransformerWrapper`'
 
         if exists(self.embeds):
             assert len(embed_ids) == len(self.embeds)
@@ -1008,6 +1183,7 @@ class transformerwrap:
         x = self.emb_dropout(x)
 
         x = self.project_emb(x)
+
 
         if not self.recycling:
             assert not exists(recycle_steps) or recycle_steps == 1, 'you did not train with recycling'
@@ -1067,12 +1243,28 @@ class transformerwrap:
             out = x
         else:
             out = logits
+        if return_intermediates:
+            return out, intermediates
+
+        if return_attn_z_loss:
+            pre_softmax_attns = [t.pre_softmax_attn for t in intermediates.attn_intermediates]
+            intermediates.attn_z_loss = calc_z_loss(pre_softmax_attns, weight=attn_z_loss_weight)
+            return_intermediates = True
+
+
+        if return_attn:
+            attn_maps = [t.post_softmax_attn for t in intermediates.attn_intermediates]
+            return out, attn_maps
 
         return out
 
-class xtransformer:
+class xtransformer(Module):
     def __init__(self,
         *,dim,
+                 tie_token_emb=False,
+                 ignore_index=-100,
+                 pad_value=0,
+                 cross_attn_tokens_dropout=0.,
          **kwargs):
         super().__init__()
         enc_kwargs, kwargs = groupby_prefix_and_trim('enc_', kwargs)# num_token , max_seq_length , depth , head
@@ -1090,20 +1282,98 @@ class xtransformer:
         dec_transformer_kwargs['scaled_sinu_pos_emb'] = dec_kwargs.pop('scaled_sinu_pos_emb', False)
         dec_transformer_kwargs['use_abs_pos_emb'] = dec_kwargs.pop('use_abs_pos_emb', True)
 
-        self.encoder = transformerwrap(**enc_transformer_kwargs,attn_layers = Encoder(dim = dim, **enc_kwargs))
-        self.decoder = transformerwrap(**dec_transformer_kwargs,attn_layers = Decoder(dim,**dec_kwargs))
+        self.cross_attn_tokens_dropout = cross_attn_tokens_dropout
 
-    def forward(self,src,tgt,mask = None):
-        enc_out = self.encoder(src,mask=mask)
+        self.encoder = transformerwrap(**enc_transformer_kwargs,return_only_embed = True,attn_layers = Encoder(dim = dim, **enc_kwargs))
+        self.decoder = transformerwrap(**dec_transformer_kwargs,attn_layers = Decoder(dim=dim , cross_attend = True, **dec_kwargs))
+        if tie_token_emb:
+            self.decoder.token_emb = self.encoder.token_emb
+        self.decoder = AutoregressiveWrapper(self.decoder, ignore_index=-100, pad_value=0)
+
+    @torch.no_grad()
+    def generate(self, seq_in, seq_out_start, seq_len, mask = None, attn_mask = None, **kwargs):
+        encodings = self.encoder(seq_in, mask = mask, attn_mask = attn_mask, return_embeddings = True)
+        return self.decoder.generate(seq_out_start, seq_len, context = encodings, context_mask = mask, **kwargs)
+
+    def forward(self,src,tgt,mask = None,attn_mask = None,src_prepend_embeds = None):
+        enc_out = self.encoder(src,mask=mask, attn_mask = attn_mask,  return_embeddings = True)
+        if exists(src_prepend_embeds) and exists(mask):
+            mask = pad_at_dim(mask, (src_prepend_embeds.shape[-2], 0), dim = -1, value = True)
+
+        if self.training and self.cross_attn_tokens_dropout > 0:
+            enc, mask = dropout_seq(enc_out, mask, self.cross_attn_tokens_dropout)
         dec_out = self.decoder(tgt,context = enc_out,mask=mask)
         return dec_out
 def main():
-    model = xtransformer(dim=512,
-                         enc_max_seq_len=512,
-                         dec_max_seq_len=512,
-                         enc_depth=6,
-                         dec_depth=6,
-                         enc_heads=8,
-                         dec_heads=8,
-                         enc_num_token=256,
-                         dec_num_token=256)
+    # constants
+
+    NUM_BATCHES = int(1e4)
+    BATCH_SIZE = 32
+    LEARNING_RATE = 3e-4
+    GENERATE_EVERY = 100
+    NUM_TOKENS = 16 + 2
+    ENC_SEQ_LEN = 32
+    DEC_SEQ_LEN = 64 + 1
+
+    # helpers
+
+    def cycle():
+        while True:
+            prefix = torch.ones((BATCH_SIZE, 1)).long().cuda()
+            src = torch.randint(2, NUM_TOKENS, (BATCH_SIZE, ENC_SEQ_LEN)).long().cuda()
+            tgt = torch.cat((prefix, src, src), 1)
+            src_mask = torch.ones(BATCH_SIZE, src.shape[1]).bool().cuda()
+            yield (src, tgt, src_mask)
+
+    # instantiate model
+
+    model = XTransformer(
+        dim=512,
+        tie_token_emb=True,
+        return_tgt_loss=True,
+        enc_num_tokens=NUM_TOKENS,
+        enc_depth=3,
+        enc_heads=8,
+        enc_max_seq_len=ENC_SEQ_LEN,
+        dec_num_tokens=NUM_TOKENS,
+        dec_depth=3,
+        dec_heads=8,
+        dec_max_seq_len=DEC_SEQ_LEN
+    ).cuda()
+
+    # optimizer
+
+    optim = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    # training
+
+    for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10., desc='training'):
+        model.train()
+
+        src, tgt, src_mask = next(cycle())
+
+        loss = model(src, tgt, mask=src_mask)
+        loss.backward()
+        print(f'{i}: {loss.item()}')
+
+        optim.step()
+        optim.zero_grad()
+
+        if i != 0 and i % GENERATE_EVERY == 0:
+            model.eval()
+            src, _, src_mask = next(cycle())
+            src, src_mask = src[:1], src_mask[:1]
+            start_tokens = (torch.ones((1, 1)) * 1).long().cuda()
+
+            sample = model.generate(src, start_tokens, ENC_SEQ_LEN, mask=src_mask)
+            incorrects = (src != sample).abs().sum()
+
+            print(f"input:  ", src)
+            print(f"predicted output:  ", sample)
+            print(f"incorrects: {incorrects}")
+
+
+if __name__ == '__main__':
+    LinearNoBias = partial(nn.Linear, bias=False)
+    DEFAULT_DIM_HEAD = 64
+    main()
